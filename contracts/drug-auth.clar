@@ -122,3 +122,102 @@
 (define-read-only (get-batch-transfer-count (batch-id uint))
     (map-get? batch-transfer-count { batch-id: batch-id })
 )
+
+
+(define-constant err-invalid-batch (err u104))
+(define-constant err-already-recalled (err u105))
+
+(define-map recalled-batches
+    { batch-id: uint }
+    {
+        recall-reason: (string-ascii 256),
+        recall-date: uint,
+        severity-level: (string-ascii 20)
+    }
+)
+
+(define-public (recall-batch 
+    (batch-id uint)
+    (recall-reason (string-ascii 256))
+    (severity-level (string-ascii 20)))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none (map-get? recalled-batches { batch-id: batch-id })) err-already-recalled)
+        (map-set drug-batches
+            { batch-id: batch-id }
+            (merge batch { status: "recalled" })
+        )
+        (map-set recalled-batches
+            { batch-id: batch-id }
+            {
+                recall-reason: recall-reason,
+                recall-date: stacks-block-height,
+                severity-level: severity-level
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-recall-details (batch-id uint))
+    (map-get? recalled-batches { batch-id: batch-id })
+)
+
+
+(define-constant err-invalid-verification (err u106))
+
+(define-map quality-verifications
+    { batch-id: uint, verification-id: uint }
+    {
+        verifier: principal,
+        timestamp: uint,
+        location: (string-ascii 64),
+        temperature: int,
+        humidity: int,
+        passed: bool
+    }
+)
+
+(define-map batch-verification-count
+    { batch-id: uint }
+    { count: uint }
+)
+
+(define-public (add-quality-verification
+    (batch-id uint)
+    (location (string-ascii 64))
+    (temperature int)
+    (humidity int)
+    (passed bool))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found))
+         (verification-count (default-to { count: u0 } (map-get? batch-verification-count { batch-id: batch-id }))))
+        (asserts! (is-eq (get current-holder batch) tx-sender) err-owner-only)
+        (map-set quality-verifications
+            {
+                batch-id: batch-id,
+                verification-id: (get count verification-count)
+            }
+            {
+                verifier: tx-sender,
+                timestamp: stacks-block-height,
+                location: location,
+                temperature: temperature,
+                humidity: humidity,
+                passed: passed
+            }
+        )
+        (map-set batch-verification-count
+            { batch-id: batch-id }
+            { count: (+ (get count verification-count) u1) }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-quality-verification 
+    (batch-id uint)
+    (verification-id uint))
+    (map-get? quality-verifications { batch-id: batch-id, verification-id: verification-id })
+)
