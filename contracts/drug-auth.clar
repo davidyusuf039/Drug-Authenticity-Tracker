@@ -221,3 +221,108 @@
     (verification-id uint))
     (map-get? quality-verifications { batch-id: batch-id, verification-id: verification-id })
 )
+
+(define-constant err-already-expired (err u107))
+(define-constant err-invalid-alert-period (err u108))
+
+(define-map expiry-alerts
+    { batch-id: uint }
+    {
+        alert-before-days: uint,
+        alert-set-by: principal,
+        alert-timestamp: uint
+    }
+)
+
+(define-map expired-batches
+    { batch-id: uint }
+    {
+        expired-timestamp: uint,
+        marked-by: principal
+    }
+)
+
+(define-public (set-expiry-alert
+    (batch-id uint)
+    (alert-before-days uint))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        (asserts! (is-eq (get current-holder batch) tx-sender) err-owner-only)
+        (asserts! (> alert-before-days u0) err-invalid-alert-period)
+        (map-set expiry-alerts
+            { batch-id: batch-id }
+            {
+                alert-before-days: alert-before-days,
+                alert-set-by: tx-sender,
+                alert-timestamp: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (mark-batch-expired
+    (batch-id uint))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        (asserts! (>= stacks-block-height (get expiry-date batch)) err-invalid-status)
+        (asserts! (is-none (map-get? expired-batches { batch-id: batch-id })) err-already-expired)
+        (map-set drug-batches
+            { batch-id: batch-id }
+            (merge batch { status: "expired" })
+        )
+        (map-set expired-batches
+            { batch-id: batch-id }
+            {
+                expired-timestamp: stacks-block-height,
+                marked-by: tx-sender
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (is-batch-expired (batch-id uint))
+    (match (map-get? drug-batches { batch-id: batch-id })
+        batch (>= stacks-block-height (get expiry-date batch))
+        false
+    )
+)
+
+(define-read-only (is-batch-expiring-soon (batch-id uint))
+    (match (map-get? drug-batches { batch-id: batch-id })
+        batch (match (map-get? expiry-alerts { batch-id: batch-id })
+            alert (let
+                ((alert-threshold (- (get expiry-date batch) (get alert-before-days alert))))
+                (and 
+                    (>= stacks-block-height alert-threshold)
+                    (< stacks-block-height (get expiry-date batch))
+                )
+            )
+            false
+        )
+        false
+    )
+)
+
+(define-read-only (get-expiry-alert (batch-id uint))
+    (map-get? expiry-alerts { batch-id: batch-id })
+)
+
+(define-read-only (get-expired-batch-details (batch-id uint))
+    (map-get? expired-batches { batch-id: batch-id })
+)
+
+(define-read-only (get-batch-expiry-status (batch-id uint))
+    (let
+        ((is-expired (is-batch-expired batch-id))
+         (is-expiring-soon (is-batch-expiring-soon batch-id)))
+        (if is-expired
+            "expired"
+            (if is-expiring-soon
+                "expiring-soon"
+                "valid"
+            )
+        )
+    )
+)
