@@ -326,3 +326,177 @@
         )
     )
 )
+
+(define-constant err-invalid-score (err u109))
+(define-constant max-score u1000)
+(define-constant base-score u500)
+
+(define-map holder-reputation
+    { holder: principal }
+    {
+        successful-transfers: uint,
+        failed-verifications: uint,
+        total-batches-handled: uint,
+        reputation-score: uint
+    }
+)
+
+(define-map batch-authenticity-score
+    { batch-id: uint }
+    {
+        current-score: uint,
+        last-updated: uint,
+        factors: {
+            quality-score: uint,
+            transfer-score: uint,
+            holder-score: uint
+        }
+    }
+)
+
+(define-public (calculate-batch-score (batch-id uint))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found))
+         (verification-count (default-to { count: u0 } (map-get? batch-verification-count { batch-id: batch-id })))
+         (transfer-count (default-to { count: u0 } (map-get? batch-transfer-count { batch-id: batch-id })))
+         (holder-reputation-score (match (map-get? holder-reputation { holder: (get current-holder batch) })
+            reputation (get reputation-score reputation)
+            base-score))
+         (quality-score (calculate-quality-score batch-id (get count verification-count)))
+         (transfer-score (calculate-transfer-score (get count transfer-count)))
+         (holder-score (if (< holder-reputation-score u300) holder-reputation-score u300)))
+        (let
+            ((total-score (if (< (+ quality-score transfer-score holder-score) max-score) (+ quality-score transfer-score holder-score) max-score)))
+            (map-set batch-authenticity-score
+                { batch-id: batch-id }
+                {
+                    current-score: total-score,
+                    last-updated: stacks-block-height,
+                    factors: {
+                        quality-score: quality-score,
+                        transfer-score: transfer-score,
+                        holder-score: holder-score
+                    }
+                }
+            )
+            (ok total-score)
+        )
+    )
+)
+
+(define-private (calculate-quality-score (batch-id uint) (verification-count uint))
+    (if (> verification-count u0)
+        (let
+            ((base-quality-score (if (<= verification-count u3)
+                u150
+                (if (<= verification-count u6)
+                    u200
+                    u250
+                )
+            )))
+            (if (< base-quality-score u300) base-quality-score u300)
+        )
+        u100
+    )
+)
+
+(define-private (calculate-transfer-score (transfer-count uint))
+    (if (is-eq transfer-count u0)
+        u200
+        (if (<= transfer-count u3)
+            u200
+            (if (<= transfer-count u6)
+                u150
+                u100
+            )
+        )
+    )
+)
+
+
+
+(define-public (update-holder-reputation (holder principal) (successful-transfer bool))
+    (let
+        ((current-rep (default-to 
+            { successful-transfers: u0, failed-verifications: u0, total-batches-handled: u0, reputation-score: base-score }
+            (map-get? holder-reputation { holder: holder }))))
+        (let
+            ((new-successful (if successful-transfer 
+                (+ (get successful-transfers current-rep) u1)
+                (get successful-transfers current-rep)))
+             (new-failed (if successful-transfer
+                (get failed-verifications current-rep)
+                (+ (get failed-verifications current-rep) u1)))
+             (new-total (+ (get total-batches-handled current-rep) u1)))
+            (let
+                ((new-score (calculate-reputation-score new-successful new-failed new-total)))
+                (map-set holder-reputation
+                    { holder: holder }
+                    {
+                        successful-transfers: new-successful,
+                        failed-verifications: new-failed,
+                        total-batches-handled: new-total,
+                        reputation-score: new-score
+                    }
+                )
+                (ok new-score)
+            )
+        )
+    )
+)
+
+(define-private (calculate-reputation-score (successful uint) (failed uint) (total uint))
+    (if (is-eq total u0)
+        base-score
+        (let
+            ((success-rate (/ (* successful u1000) total)))
+            (if (>= success-rate u800)
+                (if (< (+ base-score u200) max-score) (+ base-score u200) max-score)
+                (if (>= success-rate u600)
+                    (if (< (+ base-score u100) max-score) (+ base-score u100) max-score)
+                    (if (>= success-rate u400)
+                        base-score
+                        (if (> (- base-score u100) u100) (- base-score u100) u100)
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-public (rate-batch-quality (batch-id uint) (quality-rating uint))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        (asserts! (is-eq (get current-holder batch) tx-sender) err-owner-only)
+        (asserts! (<= quality-rating u10) err-invalid-score)
+        (unwrap-panic (update-holder-reputation tx-sender (>= quality-rating u7)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-batch-authenticity-score (batch-id uint))
+    (map-get? batch-authenticity-score { batch-id: batch-id })
+)
+
+(define-read-only (get-holder-reputation (holder principal))
+    (map-get? holder-reputation { holder: holder })
+)
+
+(define-read-only (get-batch-trust-level (batch-id uint))
+    (match (map-get? batch-authenticity-score { batch-id: batch-id })
+        score (let
+            ((current-score (get current-score score)))
+            (if (>= current-score u800)
+                "high-trust"
+                (if (>= current-score u600)
+                    "medium-trust"
+                    (if (>= current-score u400)
+                        "low-trust"
+                        "untrusted"
+                    )
+                )
+            )
+        )
+        "unscored"
+    )
+)
