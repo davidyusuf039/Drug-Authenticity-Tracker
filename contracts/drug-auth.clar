@@ -500,3 +500,338 @@
         "unscored"
     )
 )
+
+;; Contamination Detection and Quarantine System
+(define-constant err-already-contaminated (err u110))
+(define-constant err-not-contaminated (err u111))
+(define-constant err-quarantine-active (err u112))
+(define-constant err-invalid-contamination-type (err u113))
+(define-constant err-unauthorized-quarantine (err u114))
+
+;; Track contamination events for each batch
+(define-map contamination-events
+    { batch-id: uint }
+    {
+        contamination-type: (string-ascii 50),
+        detected-by: principal,
+        detection-timestamp: uint,
+        severity-level: uint,
+        source-location: (string-ascii 100),
+        confirmed: bool
+    }
+)
+
+;; Track quarantine status and details
+(define-map quarantine-status
+    { batch-id: uint }
+    {
+        quarantined: bool,
+        quarantine-timestamp: uint,
+        quarantined-by: principal,
+        quarantine-reason: (string-ascii 200),
+        estimated-release-date: uint,
+        requires-testing: bool
+    }
+)
+
+;; Track cross-contamination risks between batches
+(define-map cross-contamination-risks
+    { source-batch: uint, target-batch: uint }
+    {
+        risk-level: uint,
+        assessed-timestamp: uint,
+        risk-factors: (string-ascii 150),
+        mitigation-required: bool
+    }
+)
+
+;; Track contamination investigation results
+(define-map contamination-investigations
+    { batch-id: uint }
+    {
+        investigator: principal,
+        investigation-start: uint,
+        investigation-complete: bool,
+        findings: (string-ascii 300),
+        clearance-granted: bool,
+        follow-up-required: bool
+    }
+)
+
+;; Report contamination event for a batch
+(define-public (report-contamination
+    (batch-id uint)
+    (contamination-type (string-ascii 50))
+    (severity-level uint)
+    (source-location (string-ascii 100)))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        ;; Verify batch exists and caller has authority
+        (asserts! (or (is-eq tx-sender contract-owner) 
+                     (is-eq tx-sender (get current-holder batch))) err-owner-only)
+        ;; Validate severity level (1-10 scale)
+        (asserts! (and (>= severity-level u1) (<= severity-level u10)) err-invalid-contamination-type)
+        ;; Check if batch is not already contaminated
+        (asserts! (is-none (map-get? contamination-events { batch-id: batch-id })) err-already-contaminated)
+        
+        ;; Record contamination event
+        (map-set contamination-events
+            { batch-id: batch-id }
+            {
+                contamination-type: contamination-type,
+                detected-by: tx-sender,
+                detection-timestamp: stacks-block-height,
+                severity-level: severity-level,
+                source-location: source-location,
+                confirmed: false
+            }
+        )
+        
+        ;; Auto-quarantine if severity is high (>= 7)
+        (if (>= severity-level u7)
+            (begin
+                (try! (initiate-quarantine batch-id "Auto-quarantine due to high severity contamination"))
+                (ok "contamination-reported-and-quarantined")
+            )
+            (ok "contamination-reported")
+        )
+    )
+)
+
+;; Confirm contamination after investigation
+(define-public (confirm-contamination (batch-id uint))
+    (let
+        ((contamination (unwrap! (map-get? contamination-events { batch-id: batch-id }) err-not-contaminated)))
+        ;; Only contract owner or original detector can confirm
+        (asserts! (or (is-eq tx-sender contract-owner) 
+                     (is-eq tx-sender (get detected-by contamination))) err-owner-only)
+        
+        ;; Update contamination status to confirmed
+        (map-set contamination-events
+            { batch-id: batch-id }
+            (merge contamination { confirmed: true })
+        )
+        
+        ;; Force quarantine if not already quarantined
+        (match (map-get? quarantine-status { batch-id: batch-id })
+            quarantine (ok "contamination-confirmed")
+            (begin
+                (try! (initiate-quarantine batch-id "Contamination confirmed - mandatory quarantine"))
+                (ok "contamination-confirmed-and-quarantined")
+            )
+        )
+    )
+)
+
+;; Initiate quarantine for a batch
+(define-public (initiate-quarantine 
+    (batch-id uint)
+    (quarantine-reason (string-ascii 200)))
+    (let
+        ((batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        ;; Verify authorization (owner, current holder, or in contamination event)
+        (asserts! (or (is-eq tx-sender contract-owner)
+                     (is-eq tx-sender (get current-holder batch))
+                     (is-some (map-get? contamination-events { batch-id: batch-id }))) err-unauthorized-quarantine)
+        ;; Check if not already quarantined
+        (match (map-get? quarantine-status { batch-id: batch-id })
+            existing-quarantine (asserts! (not (get quarantined existing-quarantine)) err-quarantine-active)
+            true
+        )
+        
+        ;; Set quarantine status
+        (map-set quarantine-status
+            { batch-id: batch-id }
+            {
+                quarantined: true,
+                quarantine-timestamp: stacks-block-height,
+                quarantined-by: tx-sender,
+                quarantine-reason: quarantine-reason,
+                estimated-release-date: (+ stacks-block-height u1008), ;; ~1 week default
+                requires-testing: true
+            }
+        )
+        
+        ;; Update batch status
+        (map-set drug-batches
+            { batch-id: batch-id }
+            (merge batch { status: "quarantined" })
+        )
+        
+        ;; Assess cross-contamination risks
+        (try! (assess-cross-contamination-risks batch-id))
+        (ok true)
+    )
+)
+
+;; Assess cross-contamination risks for batches that interacted with contaminated batch
+(define-public (assess-cross-contamination-risks (contaminated-batch-id uint))
+    (let
+        ((transfer-count (default-to { count: u0 } (map-get? batch-transfer-count { batch-id: contaminated-batch-id }))))
+        ;; Only authorized personnel can assess risks
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        
+        ;; Assess risk for recent transfers (simplified - checks last 3 transfers)
+        (let
+            ((risk-assessment-result (assess-recent-transfers contaminated-batch-id (get count transfer-count))))
+            (ok risk-assessment-result)
+        )
+    )
+)
+
+;; Helper function to assess risks from recent transfers
+(define-private (assess-recent-transfers (batch-id uint) (transfer-count uint))
+    (if (> transfer-count u0)
+        (let
+            ((recent-transfer (map-get? transfer-history { batch-id: batch-id, transfer-id: (- transfer-count u1) })))
+            (match recent-transfer
+                transfer (begin
+                    ;; Record cross-contamination risk
+                    (map-set cross-contamination-risks
+                        { source-batch: batch-id, target-batch: batch-id }
+                        {
+                            risk-level: u7,
+                            assessed-timestamp: stacks-block-height,
+                            risk-factors: "Recent transfer from contaminated batch",
+                            mitigation-required: true
+                        }
+                    )
+                    u1
+                )
+                u0
+            )
+        )
+        u0
+    )
+)
+
+;; Start contamination investigation
+(define-public (start-investigation 
+    (batch-id uint)
+    (investigator principal))
+    (begin
+        ;; Only contract owner can assign investigators
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Batch must be contaminated or quarantined
+        (asserts! (or (is-some (map-get? contamination-events { batch-id: batch-id }))
+                     (is-some (map-get? quarantine-status { batch-id: batch-id }))) err-not-found)
+        
+        (map-set contamination-investigations
+            { batch-id: batch-id }
+            {
+                investigator: investigator,
+                investigation-start: stacks-block-height,
+                investigation-complete: false,
+                findings: "",
+                clearance-granted: false,
+                follow-up-required: false
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Complete investigation and provide findings
+(define-public (complete-investigation
+    (batch-id uint)
+    (findings (string-ascii 300))
+    (clearance-granted bool)
+    (follow-up-required bool))
+    (let
+        ((investigation (unwrap! (map-get? contamination-investigations { batch-id: batch-id }) err-not-found)))
+        ;; Only assigned investigator can complete
+        (asserts! (is-eq tx-sender (get investigator investigation)) err-owner-only)
+        ;; Investigation must not be already complete
+        (asserts! (not (get investigation-complete investigation)) err-invalid-status)
+        
+        (map-set contamination-investigations
+            { batch-id: batch-id }
+            (merge investigation {
+                investigation-complete: true,
+                findings: findings,
+                clearance-granted: clearance-granted,
+                follow-up-required: follow-up-required
+            })
+        )
+        
+        ;; If clearance granted, release from quarantine
+        (if clearance-granted
+            (unwrap-panic (release-from-quarantine batch-id))
+            false
+        )
+        (ok true)
+    )
+)
+
+;; Release batch from quarantine
+(define-public (release-from-quarantine (batch-id uint))
+    (let
+        ((quarantine (unwrap! (map-get? quarantine-status { batch-id: batch-id }) err-not-found))
+         (batch (unwrap! (map-get? drug-batches { batch-id: batch-id }) err-not-found)))
+        ;; Only contract owner can release from quarantine
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        ;; Batch must be quarantined
+        (asserts! (get quarantined quarantine) err-not-found)
+        
+        ;; Update quarantine status
+        (map-set quarantine-status
+            { batch-id: batch-id }
+            (merge quarantine { quarantined: false })
+        )
+        
+        ;; Update batch status back to previous or set as cleared
+        (map-set drug-batches
+            { batch-id: batch-id }
+            (merge batch { status: "cleared" })
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions for contamination system
+(define-read-only (get-contamination-details (batch-id uint))
+    (map-get? contamination-events { batch-id: batch-id })
+)
+
+(define-read-only (get-quarantine-status (batch-id uint))
+    (map-get? quarantine-status { batch-id: batch-id })
+)
+
+(define-read-only (is-batch-quarantined (batch-id uint))
+    (match (map-get? quarantine-status { batch-id: batch-id })
+        quarantine (get quarantined quarantine)
+        false
+    )
+)
+
+(define-read-only (get-cross-contamination-risk (source-batch uint) (target-batch uint))
+    (map-get? cross-contamination-risks { source-batch: source-batch, target-batch: target-batch })
+)
+
+(define-read-only (get-investigation-status (batch-id uint))
+    (map-get? contamination-investigations { batch-id: batch-id })
+)
+
+(define-read-only (is-batch-contaminated (batch-id uint))
+    (is-some (map-get? contamination-events { batch-id: batch-id }))
+)
+
+(define-read-only (get-batch-safety-status (batch-id uint))
+    (let
+        ((is-contaminated (is-batch-contaminated batch-id))
+         (is-quarantined (is-batch-quarantined batch-id)))
+        (if is-contaminated
+            (if is-quarantined
+                "contaminated-quarantined"
+                "contaminated-active"
+            )
+            (if is-quarantined
+                "quarantined-precautionary"
+                "safe"
+            )
+        )
+    )
+)
+
+
+
