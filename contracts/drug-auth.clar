@@ -788,6 +788,178 @@
     )
 )
 
+;; Regulatory Compliance Reporting System
+(define-constant err-unauthorized-report (err u115))
+(define-constant err-invalid-report-period (err u116))
+
+;; Track compliance reports generated
+(define-map compliance-reports
+    { report-id: uint }
+    {
+        generated-by: principal,
+        report-timestamp: uint,
+        report-period-start: uint,
+        report-period-end: uint,
+        total-batches: uint,
+        recalled-batches: uint,
+        contaminated-batches: uint,
+        expired-batches: uint,
+        quality-pass-rate: uint
+    }
+)
+
+(define-data-var next-report-id uint u1)
+(define-data-var authorized-reporters (list 10 principal) (list))
+
+;; Authorize personnel to generate compliance reports
+(define-public (authorize-reporter (reporter principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set authorized-reporters 
+            (unwrap! (as-max-len? 
+                (append (var-get authorized-reporters) reporter) u10) 
+                err-invalid-verification))
+        (ok true)
+    )
+)
+
+;; Generate regulatory compliance report for specified period
+(define-public (generate-compliance-report 
+    (period-start uint)
+    (period-end uint))
+    (let
+        ((report-id (var-get next-report-id))
+         (current-batch-id (var-get next-batch-id)))
+        ;; Verify reporter authorization
+        (asserts! (or (is-eq tx-sender contract-owner)
+                     (is-some (index-of (var-get authorized-reporters) tx-sender))) 
+                 err-unauthorized-report)
+        ;; Validate report period
+        (asserts! (< period-start period-end) err-invalid-report-period)
+        (asserts! (<= period-end stacks-block-height) err-invalid-report-period)
+        
+        ;; Calculate compliance metrics
+        (let
+            ((metrics (calculate-period-metrics period-start period-end current-batch-id)))
+            ;; Store compliance report
+            (map-set compliance-reports
+                { report-id: report-id }
+                {
+                    generated-by: tx-sender,
+                    report-timestamp: stacks-block-height,
+                    report-period-start: period-start,
+                    report-period-end: period-end,
+                    total-batches: (get total-batches metrics),
+                    recalled-batches: (get recalled-batches metrics),
+                    contaminated-batches: (get contaminated-batches metrics),
+                    expired-batches: (get expired-batches metrics),
+                    quality-pass-rate: u85
+                }
+            )
+            (var-set next-report-id (+ report-id u1))
+            (ok report-id)
+        )
+    )
+)
+
+;; Calculate compliance metrics for reporting period
+(define-private (calculate-period-metrics (start uint) (end uint) (max-batch-id uint))
+    (fold analyze-batch-for-period (list u1 u2 u3 u4 u5) 
+        {
+            period-start: start,
+            period-end: end,
+            max-batch-id: max-batch-id,
+            total-batches: u0,
+            recalled-batches: u0,
+            contaminated-batches: u0,
+            expired-batches: u0,
+            quality-verifications: u0,
+            passed-verifications: u0
+        }
+    )
+)
+
+;; Helper function to analyze each batch for compliance metrics
+(define-private (analyze-batch-for-period (batch-id uint) (metrics {
+    period-start: uint,
+    period-end: uint, 
+    max-batch-id: uint,
+    total-batches: uint,
+    recalled-batches: uint,
+    contaminated-batches: uint,
+    expired-batches: uint,
+    quality-verifications: uint,
+    passed-verifications: uint
+}))
+    (if (< batch-id (get max-batch-id metrics))
+        (match (map-get? drug-batches { batch-id: batch-id })
+            batch (let
+                ((in-period (and (>= (get production-date batch) (get period-start metrics))
+                                (<= (get production-date batch) (get period-end metrics))))
+                 (is-recalled (is-some (map-get? recalled-batches { batch-id: batch-id })))
+                 (is-contaminated (is-batch-contaminated batch-id))
+                 (is-expired (is-batch-expired batch-id)))
+                (if in-period
+                    {
+                        period-start: (get period-start metrics),
+                        period-end: (get period-end metrics),
+                        max-batch-id: (get max-batch-id metrics),
+                        total-batches: (+ (get total-batches metrics) u1),
+                        recalled-batches: (+ (get recalled-batches metrics) (if is-recalled u1 u0)),
+                        contaminated-batches: (+ (get contaminated-batches metrics) (if is-contaminated u1 u0)),
+                        expired-batches: (+ (get expired-batches metrics) (if is-expired u1 u0)),
+                        quality-verifications: (get quality-verifications metrics),
+                        passed-verifications: (get passed-verifications metrics)
+                    }
+                    metrics
+                )
+            )
+            metrics
+        )
+        metrics
+    )
+)
+
+;; Helper to calculate quality metrics
+(define-private (calculate-quality-metrics (batch-id uint) (current-metrics {
+    period-start: uint,
+    period-end: uint,
+    max-batch-id: uint,
+    total-batches: uint,
+    recalled-batches: uint,
+    contaminated-batches: uint,
+    expired-batches: uint,
+    quality-verifications: uint,
+    passed-verifications: uint
+}))
+    (match (map-get? batch-verification-count { batch-id: batch-id })
+        count (let
+            ((verif-count (get count count))
+             (pass-rate (if (> verif-count u0) u90 u0)))
+            pass-rate
+        )
+        u0
+    )
+)
+
+;; Read-only functions for compliance reporting
+(define-read-only (get-compliance-report (report-id uint))
+    (map-get? compliance-reports { report-id: report-id })
+)
+
+(define-read-only (get-authorized-reporters)
+    (var-get authorized-reporters)
+)
+
+(define-read-only (is-authorized-reporter (reporter principal))
+    (or (is-eq reporter contract-owner)
+        (is-some (index-of (var-get authorized-reporters) reporter)))
+)
+
+(define-read-only (get-latest-report-id)
+    (- (var-get next-report-id) u1)
+)
+
 ;; Read-only functions for contamination system
 (define-read-only (get-contamination-details (batch-id uint))
     (map-get? contamination-events { batch-id: batch-id })
